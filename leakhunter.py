@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""
-coleta_dados.py - Recon avançado para Pentest / Bug Bounty
-Integrado: katana, subfinder, assetfinder, gau, waybackurls
-Análise  : JS secrets, endpoints, subdomínios, robots.txt, arquivos sensíveis
-⚠  Use apenas em alvos com autorização explícita.
-"""
+
 
 import os
 import re
