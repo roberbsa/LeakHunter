@@ -46,4 +46,4 @@ Detecção baseada em regex para:
 ##  Uso
 
 ```bash
-python3 coleta_dados.py exemplo.com
+python3 leakhunter.py exemplo.com
