@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-coleta_dados.py - Ferramenta de reconhecimento e análise para Pentest / Bug Bounty
-Uso autorizado apenas em alvos com permissão explícita.
+coleta_dados.py - Recon avançado para Pentest / Bug Bounty
+Integrado: katana, subfinder, assetfinder, gau, waybackurls
+Análise  : JS secrets, endpoints, subdomínios, robots.txt, arquivos sensíveis
+⚠  Use apenas em alvos com autorização explícita.
 """
 
 import os
@@ -14,6 +16,7 @@ import tarfile
 import zipfile
 import hashlib
 import argparse
+import threading
 import subprocess
 from pathlib import Path
 from datetime import datetime
@@ -31,10 +34,12 @@ class C:
     GREEN   = "\033[92m"
     CYAN    = "\033[96m"
     MAGENTA = "\033[95m"
+    BLUE    = "\033[94m"
     BOLD    = "\033[1m"
+    DIM     = "\033[2m"
     RESET   = "\033[0m"
 
-def cor_severity(sev: str) -> str:
+def cor_sev(sev):
     return {
         "critical": C.RED + C.BOLD,
         "high":     C.RED,
@@ -42,9 +47,6 @@ def cor_severity(sev: str) -> str:
         "low":      C.CYAN,
     }.get(sev, C.RESET)
 
-# ============================================================
-# BANNER
-# ============================================================
 BANNER = f"""
 {C.CYAN}{C.BOLD}
  ██╗     ███████╗ █████╗ ██╗  ██╗██╗  ██╗██╗   ██╗███╗   ██╗████████╗███████╗██████╗ 
@@ -62,102 +64,85 @@ BANNER = f"""
 # ARGUMENTOS CLI
 # ============================================================
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Coleta e análise de arquivos públicos de um domínio."
-    )
-    parser.add_argument(
-        "dominio",
-        nargs="?",
-        default=None,
-        help="Domínio alvo (ex: exemplo.com)"
-    )
-    parser.add_argument(
-        "--threads",
-        type=int,
-        default=5,
-        help="Número de threads para download paralelo (padrão: 5)"
-    )
-    parser.add_argument(
-        "--timeout",
-        type=int,
-        default=60,
-        help="Timeout de download em segundos (padrão: 60)"
-    )
-    parser.add_argument(
-        "--max-size",
-        type=int,
-        default=30,
-        help="Tamanho máximo de download em MB (padrão: 30)"
-    )
-    parser.add_argument(
-        "--sem-wayback",
-        action="store_true",
-        help="Pular coleta via waybackurls"
-    )
-    parser.add_argument(
-        "--sem-gau",
-        action="store_true",
-        help="Pular coleta via gau"
-    )
-    parser.add_argument(
-        "--sem-download",
-        action="store_true",
-        help="Apenas coletar URLs, sem baixar arquivos"
-    )
-    parser.add_argument(
-        "--min-severity",
-        choices=["low", "medium", "high", "critical"],
-        default="low",
-        help="Severidade mínima para exibir alertas em tempo real (padrão: low)"
-    )
-    return parser.parse_args()
+    p = argparse.ArgumentParser(
+        description="Recon avançado para Bug Bounty",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog="""Exemplos:
+  python3 coleta_dados.py exemplo.com
+  python3 coleta_dados.py exemplo.com --threads 20 --katana-depth 5
+  python3 coleta_dados.py exemplo.com --sem-subdomain --min-severity high
+  python3 coleta_dados.py exemplo.com --scope-file meus_subs.txt
+  python3 coleta_dados.py exemplo.com --sem-download   # só coleta URLs
+""")
+    p.add_argument("dominio",          nargs="?", default=None)
+    p.add_argument("--threads",        type=int,  default=10)
+    p.add_argument("--timeout",        type=int,  default=30)
+    p.add_argument("--max-size",       type=int,  default=10,   help="MB máximo por arquivo (padrão: 10)")
+    p.add_argument("--katana-depth",   type=int,  default=3,    help="Profundidade do katana (padrão: 3)")
+    p.add_argument("--min-severity",   choices=["low","medium","high","critical"], default="low")
+    p.add_argument("--sem-katana",     action="store_true")
+    p.add_argument("--sem-gau",        action="store_true")
+    p.add_argument("--sem-wayback",    action="store_true")
+    p.add_argument("--sem-subdomain",  action="store_true")
+    p.add_argument("--sem-download",   action="store_true")
+    p.add_argument("--scope-file",     type=str,  default=None, help="Arquivo .txt com subdomínios no escopo")
+    return p.parse_args()
 
-# ============================================================
-# CONFIG GLOBAL (preenchida após parse_args)
-# ============================================================
 CONFIG = {}
+LOCK   = threading.Lock()
 
-EXTENSOES_INTERESSE = (
-    ".js", ".json", ".map", ".env", ".log", ".bak", ".old", ".zip", ".tar", ".gz",
-    ".tgz", ".7z", ".rar", ".conf", ".config", ".ini", ".yaml", ".yml", ".sql",
-    ".xml", ".txt", ".pdf", ".doc", ".docx", ".csv", ".pem", ".key", ".crt",
-    ".pfx", ".p12", ".db", ".sqlite", ".sqlite3", ".backup", ".swp", ".sh",
-    ".bash", ".htaccess", ".htpasswd", ".DS_Store", ".npmrc", ".netrc",
-    ".git", ".gitconfig", ".gitignore", ".dockerignore", ".dockerfile",
-    ".toml", ".lock", ".gradle", ".properties",
+# ============================================================
+# EXTENSÕES
+# ============================================================
+EXTS_INTERESSE = (
+    ".js", ".json", ".map", ".env", ".log", ".bak", ".old", ".zip", ".tar",
+    ".gz", ".tgz", ".7z", ".rar", ".conf", ".config", ".ini", ".yaml", ".yml",
+    ".sql", ".xml", ".txt", ".pdf", ".doc", ".docx", ".csv", ".pem", ".key",
+    ".crt", ".pfx", ".p12", ".db", ".sqlite", ".sqlite3", ".backup", ".swp",
+    ".sh", ".bash", ".htaccess", ".htpasswd", ".npmrc", ".netrc", ".toml",
+    ".lock", ".properties", ".gradle", ".DS_Store",
+)
+EXTS_SENSIVEIS = (
+    ".env", ".bak", ".old", ".zip", ".tar", ".gz", ".tgz", ".sql", ".pem",
+    ".key", ".pfx", ".p12", ".db", ".sqlite", ".sqlite3", ".backup", ".config",
+    ".ini", ".yaml", ".yml", ".conf", ".htpasswd", ".netrc", ".npmrc",
+)
+EXTS_CRITICAS = (
+    ".env", ".sql", ".pem", ".key", ".pfx", ".p12", ".db", ".sqlite",
+    ".sqlite3", ".htpasswd", ".netrc", ".npmrc",
 )
 
-EXTENSOES_SENSIVEIS = (
-    ".env", ".bak", ".old", ".zip", ".tar", ".gz", ".tgz", ".7z", ".rar", ".sql",
-    ".pem", ".key", ".pfx", ".p12", ".db", ".sqlite", ".sqlite3", ".backup",
-    ".config", ".ini", ".yaml", ".yml", ".conf", ".htpasswd", ".netrc", ".npmrc",
-)
-
-EXTENSOES_CRITICAS = (
-    ".env", ".sql", ".pem", ".key", ".pfx", ".p12", ".db", ".sqlite", ".sqlite3",
-    ".htpasswd", ".netrc", ".npmrc",
-)
-
-RETRY_DOWNLOAD = 3
-ROBOTS_STATUS_INTERESSANTES = {"200", "204", "301", "302", "401", "403"}
-SEVERITY_ORDER = {"low": 1, "medium": 2, "high": 3, "critical": 4}
+SEVERITY_ORDER  = {"low": 1, "medium": 2, "high": 3, "critical": 4}
+RETRY           = 3
+ROBOTS_STATUS   = {"200", "204", "301", "302", "401", "403"}
 
 # ============================================================
 # PADRÕES DE DETECÇÃO
 # ============================================================
 PATTERNS = {
+    # ── Tokens / Auth ──────────────────────────────────────
     "JWT": {
         "regex": r"\beyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9._-]+\.[a-zA-Z0-9._-]+\b",
         "severity": "high",
     },
+    "Bearer Token": {
+        "regex": r"\bBearer\s+[A-Za-z0-9\-._~+/]+=*\b",
+        "severity": "high",
+    },
+    "Basic Auth": {
+        "regex": r"\bBasic\s+[A-Za-z0-9+/=]{8,}\b",
+        "severity": "medium",
+    },
+    # ── AWS ────────────────────────────────────────────────
     "AWS Access Key": {
         "regex": r"\bAKIA[0-9A-Z]{16}\b",
         "severity": "critical",
     },
     "AWS Secret Key": {
-        "regex": r"""(?i)\baws[_\-\s]?secret[_\-\s]?(?:access[_\-\s]?)?key\b\s*[:=]\s*['"]?[A-Za-z0-9/+]{40}['"]?""",
+        "regex": r"""(?i)aws[_\-\s]?secret[_\-\s]?(?:access[_\-\s]?)?key\s*[:=]\s*['"]?[A-Za-z0-9/+]{40}['"]?""",
         "severity": "critical",
     },
+    # ── Google ─────────────────────────────────────────────
     "Google API Key": {
         "regex": r"\bAIza[0-9A-Za-z\-_]{35}\b",
         "severity": "high",
@@ -170,7 +155,8 @@ PATTERNS = {
         "regex": r"\bhttps://[a-z0-9-]+\.firebaseio\.com\b",
         "severity": "medium",
     },
-    "Stripe Live Key": {
+    # ── Stripe ─────────────────────────────────────────────
+    "Stripe Secret Key": {
         "regex": r"\bsk_live_[0-9a-zA-Z]{16,}\b",
         "severity": "critical",
     },
@@ -178,13 +164,10 @@ PATTERNS = {
         "regex": r"\bpk_live_[0-9a-zA-Z]{16,}\b",
         "severity": "low",
     },
-    "Twilio Account SID": {
+    # ── Comunicação ────────────────────────────────────────
+    "Twilio SID": {
         "regex": r"\bAC[a-z0-9]{32}\b",
         "severity": "high",
-    },
-    "Twilio Auth Token": {
-        "regex": r"(?i)twilio.*\b[a-z0-9]{32}\b",
-        "severity": "critical",
     },
     "SendGrid API Key": {
         "regex": r"\bSG\.[a-zA-Z0-9\-_]{22,}\.[a-zA-Z0-9\-_]{43,}\b",
@@ -194,30 +177,11 @@ PATTERNS = {
         "regex": r"\bkey-[0-9a-zA-Z]{32}\b",
         "severity": "high",
     },
-    "Bearer Token": {
-        "regex": r"\bBearer\s+[A-Za-z0-9\-._~+/]+=*\b",
+    "Mailchimp API Key": {
+        "regex": r"\b[0-9a-f]{32}-us[0-9]{1,2}\b",
         "severity": "high",
     },
-    "Basic Auth": {
-        "regex": r"\bBasic\s+[A-Za-z0-9+/=]{8,}\b",
-        "severity": "medium",
-    },
-    "Private Key": {
-        "regex": r"-----BEGIN (?:RSA |DSA |EC |OPENSSH |PGP )?PRIVATE KEY-----",
-        "severity": "critical",
-    },
-    "Certificate": {
-        "regex": r"-----BEGIN CERTIFICATE-----",
-        "severity": "medium",
-    },
-    "Slack Token": {
-        "regex": r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b",
-        "severity": "critical",
-    },
-    "Slack Webhook": {
-        "regex": r"https://hooks\.slack\.com/services/T[A-Za-z0-9_]+/B[A-Za-z0-9_]+/[A-Za-z0-9_]+",
-        "severity": "critical",
-    },
+    # ── Repositórios / CI ──────────────────────────────────
     "GitHub Token": {
         "regex": r"\bgh[pousr]_[A-Za-z0-9]{20,}\b",
         "severity": "critical",
@@ -230,10 +194,25 @@ PATTERNS = {
         "regex": r"\bnpm_[A-Za-z0-9]{36}\b",
         "severity": "critical",
     },
-    "Heroku API Key": {
-        "regex": r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b",
-        "severity": "low",
+    # ── Slack ──────────────────────────────────────────────
+    "Slack Token": {
+        "regex": r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b",
+        "severity": "critical",
     },
+    "Slack Webhook": {
+        "regex": r"https://hooks\.slack\.com/services/T[A-Za-z0-9_]+/B[A-Za-z0-9_]+/[A-Za-z0-9_]+",
+        "severity": "critical",
+    },
+    # ── PKI / Chaves ───────────────────────────────────────
+    "Private Key": {
+        "regex": r"-----BEGIN (?:RSA |DSA |EC |OPENSSH |PGP )?PRIVATE KEY-----",
+        "severity": "critical",
+    },
+    "Certificate": {
+        "regex": r"-----BEGIN CERTIFICATE-----",
+        "severity": "medium",
+    },
+    # ── Credenciais genéricas ──────────────────────────────
     "Password Assignment": {
         "regex": r"""(?i)\b(password|passwd|pwd|senha|secret|token|api[_-]?key)\b\s*[:=]\s*['"][^'"]{6,}['"]""",
         "severity": "high",
@@ -243,41 +222,14 @@ PATTERNS = {
         "severity": "high",
     },
     "Env File Secret": {
-        "regex": r"""(?im)^(DB_PASSWORD|DATABASE_URL|AWS_SECRET_ACCESS_KEY|SECRET_KEY|API_KEY|TOKEN|ACCESS_TOKEN|PRIVATE_KEY|MAIL_PASSWORD|SMTP_PASS)\s*=\s*.+$""",
+        "regex": r"""(?im)^(DB_PASSWORD|DATABASE_URL|AWS_SECRET_ACCESS_KEY|SECRET_KEY|API_KEY|TOKEN|ACCESS_TOKEN|PRIVATE_KEY|MAIL_PASSWORD|SMTP_PASS|REDIS_URL|MONGO_URI)\s*=\s*.+$""",
         "severity": "critical",
     },
     "Connection String": {
         "regex": r"""(?i)\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp|mssql|oracle):\/\/[^\s"'<>]+""",
         "severity": "critical",
     },
-    "Internal URL": {
-        "regex": r"""https?://(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|127\.0\.0\.1|169\.254\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}|localhost)(?::\d+)?[^\s"']*""",
-        "severity": "medium",
-    },
-    "IP Address Exposed": {
-        "regex": r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b",
-        "severity": "low",
-    },
-    "Open Redirect": {
-        "regex": r"""(?i)[?&](?:redirect|return|url|next|goto|redir|redirect_uri|callback)\s*=\s*https?://""",
-        "severity": "medium",
-    },
-    "Debug Artifact": {
-        "regex": r"(?i)\b(console\.log|debugger|window\.debug)\b",
-        "severity": "low",
-    },
-    "Role / Admin Reference": {
-        "regex": r"(?i)\b(admin|superadmin|super admin|impersonate|role_impersonate|isAdmin|isSuperAdmin)\b",
-        "severity": "medium",
-    },
-    "Sentry DSN": {
-        "regex": r"https://[a-zA-Z0-9]+@[a-zA-Z0-9.-]+\.ingest\.sentry\.io/\d+",
-        "severity": "low",
-    },
-    "GraphQL Introspection": {
-        "regex": r"(?i)(/__graphql|/graphql\?query=|introspectionQuery)",
-        "severity": "low",
-    },
+    # ── Cloud Storage ──────────────────────────────────────
     "S3 Bucket": {
         "regex": r"\b[a-z0-9.\-]+\.s3(?:\.[a-z0-9-]+)?\.amazonaws\.com\b",
         "severity": "medium",
@@ -290,12 +242,61 @@ PATTERNS = {
         "regex": r"\bstorage\.googleapis\.com/[a-z0-9\-_]+\b",
         "severity": "medium",
     },
-    "Email": {
-        "regex": r"\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[A-Za-z]{2,}\b",
+    # ── Infraestrutura ─────────────────────────────────────
+    "Internal URL": {
+        "regex": r"""https?://(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|127\.0\.0\.1|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}|localhost)(?::\d+)?[^\s"']*""",
+        "severity": "medium",
+    },
+    "IP Address": {
+        "regex": r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b",
         "severity": "low",
     },
-    "Source Map Reference": {
+    # ── Web vulnerabilidades ───────────────────────────────
+    "Open Redirect": {
+        "regex": r"""(?i)[?&](?:redirect|return|url|next|goto|redir|redirect_uri|callback)\s*=\s*https?://""",
+        "severity": "medium",
+    },
+    "GraphQL Endpoint": {
+        "regex": r"(?i)(/__graphql|/graphql\?|/api/graphql|introspectionQuery)",
+        "severity": "low",
+    },
+    "Sentry DSN": {
+        "regex": r"https://[a-zA-Z0-9]+@[a-zA-Z0-9.-]+\.ingest\.sentry\.io/\d+",
+        "severity": "low",
+    },
+    "Source Map": {
         "regex": r"//# sourceMappingURL=(.+\.map)",
+        "severity": "low",
+    },
+    # ── Código / Debug ─────────────────────────────────────
+    "Debug Artifact": {
+        "regex": r"(?i)\b(console\.log|debugger|window\.debug)\b",
+        "severity": "low",
+    },
+    "Admin / Role Reference": {
+        "regex": r"(?i)\b(isAdmin|isSuperAdmin|impersonate|role_impersonate|superadmin)\b",
+        "severity": "medium",
+    },
+    "XSS Vector": {
+        "regex": r"""(?i)(eval\s*\(|innerHTML\s*=|dangerouslySetInnerHTML|document\.write\s*\()""",
+        "severity": "medium",
+    },
+    "Prototype Pollution": {
+        "regex": r"""(?i)(__proto__|constructor\[prototype\]|Object\.prototype\.)""",
+        "severity": "medium",
+    },
+    # ── JS Endpoints ───────────────────────────────────────
+    "Hidden API Endpoint": {
+        "regex": r"""['"`](/(?:api|v\d|internal|admin|graphql|rest|backend|private|auth|oauth|user|account)/[^\s'"`?#]{2,})['"`]""",
+        "severity": "medium",
+    },
+    "Absolute API URL": {
+        "regex": r"""['"`](https?://[^'"`\s]{10,})['"`]""",
+        "severity": "low",
+    },
+    # ── Misc ───────────────────────────────────────────────
+    "Email": {
+        "regex": r"\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[A-Za-z]{2,}\b",
         "severity": "low",
     },
 }
@@ -303,52 +304,64 @@ PATTERNS = {
 KEYWORDS_JS = [
     "Authorization", "Bearer ", "apiKey", "clientSecret", "secretKey",
     "accessToken", "refreshToken", "document.cookie", "localStorage.setItem",
-    "sessionStorage.setItem", "fetch(", "axios.", "XMLHttpRequest", "graphql",
-    "impersonate", "role_impersonate", "isAdmin", "isSuperAdmin",
-    "eval(", "innerHTML", "dangerouslySetInnerHTML", "postMessage",
-    "__proto__", "prototype pollution",
+    "sessionStorage.setItem", "fetch(", "axios.", "XMLHttpRequest",
+    "impersonate", "isAdmin", "isSuperAdmin", "eval(", "innerHTML",
+    "dangerouslySetInnerHTML", "postMessage", "__proto__",
+    "Access-Control-Allow-Origin", "withCredentials", "cors",
 ]
 
 # ============================================================
 # UTILITÁRIOS
 # ============================================================
-def aviso_pip(pacote: str) -> None:
-    print(f"\n{C.YELLOW}[!] Biblioteca opcional ausente: {pacote}")
-    print(f"    pip install {pacote}{C.RESET}")
+def log(msg, cor=C.RESET):
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"{C.DIM}[{ts}]{C.RESET} {cor}{msg}{C.RESET}")
 
 
-def is_interesting_url(url: str) -> bool:
+def aviso_tool(nome, install_cmd):
+    log(f"{nome} não encontrado → instale: {install_cmd}", C.YELLOW)
+
+
+def cmd_exists(name):
+    try:
+        subprocess.run([name, "--version"], capture_output=True, timeout=5)
+        return True
+    except Exception:
+        return False
+
+
+def is_interesting_url(url):
     try:
         path = urlparse(url).path.lower()
         return (
-            path.endswith(EXTENSOES_INTERESSE)
+            path.endswith(EXTS_INTERESSE)
             or path.endswith("/robots.txt")
             or path == "/robots.txt"
-            or path.endswith("/.git/config")
-            or path.endswith("/.env")
+            or "/.git/config" in path
+            or "/.env" in path
             or "backup" in path
         )
     except Exception:
         return False
 
 
-def unique_filename(url: str) -> str:
+def is_js_url(url):
+    try:
+        return urlparse(url).path.lower().endswith((".js", ".map", ".ts"))
+    except Exception:
+        return False
+
+
+def unique_filename(url):
     parsed = urlparse(url)
-    base = os.path.basename(parsed.path) or "sem_nome"
+    base   = os.path.basename(parsed.path) or "sem_nome"
     digest = hashlib.md5(url.encode()).hexdigest()[:10]
-    if parsed.path.lower().endswith("/robots.txt") or parsed.path.lower() == "/robots.txt":
+    if parsed.path.lower().endswith("/robots.txt"):
         base = "robots.txt"
     return f"{digest}_{base}"
 
 
-def is_binary_file(path: Path) -> bool:
-    try:
-        return b"\x00" in path.read_bytes()[:2048]
-    except Exception:
-        return True
-
-
-def try_decode(path: Path) -> str:
+def try_decode(path):
     raw = path.read_bytes()
     for enc in ("utf-8", "latin-1", "utf-16"):
         try:
@@ -358,184 +371,369 @@ def try_decode(path: Path) -> str:
     return ""
 
 
-def get_context(content: str, start: int, end: int, radius: int = 120) -> str:
-    left = max(0, start - radius)
-    right = min(len(content), end + radius)
-    return content[left:right].replace("\n", " ")[:300]
+def is_binary(path):
+    try:
+        return b"\x00" in path.read_bytes()[:2048]
+    except Exception:
+        return True
 
 
-def line_number(content: str, index: int) -> int:
+def get_context(content, start, end, radius=120):
+    l = max(0, start - radius)
+    r = min(len(content), end + radius)
+    return content[l:r].replace("\n", " ")[:300]
+
+
+def line_number(content, index):
     return content.count("\n", 0, index) + 1
 
 
-def extract_base_from_url(url: str) -> str:
+def extract_base(url):
     p = urlparse(url)
     return f"{p.scheme}://{p.netloc}"
 
 
 # ============================================================
+# ENUMERAÇÃO DE SUBDOMÍNIOS
+# ============================================================
+def enum_subdomains(domain, scope_file=None):
+    log("Iniciando enumeração de subdomínios...", C.CYAN)
+    subs = set()
+
+    if scope_file:
+        try:
+            with open(scope_file) as f:
+                for line in f:
+                    s = line.strip()
+                    if s:
+                        subs.add(s)
+            log(f"scope file: {len(subs)} subdomínios carregados", C.GREEN)
+        except Exception as e:
+            log(f"Erro ao ler scope file: {e}", C.YELLOW)
+
+    # subfinder
+    if cmd_exists("subfinder"):
+        try:
+            r = subprocess.run(
+                ["subfinder", "-d", domain, "-silent"],
+                capture_output=True, text=True, timeout=300
+            )
+            antes = len(subs)
+            for line in r.stdout.splitlines():
+                s = line.strip()
+                if s:
+                    subs.add(s)
+            log(f"subfinder: +{len(subs)-antes} subdomínios", C.GREEN)
+        except subprocess.TimeoutExpired:
+            log("subfinder: timeout", C.YELLOW)
+        except Exception as e:
+            log(f"subfinder erro: {e}", C.YELLOW)
+    else:
+        aviso_tool("subfinder", "go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest")
+
+    # assetfinder
+    if cmd_exists("assetfinder"):
+        try:
+            r = subprocess.run(
+                ["assetfinder", "--subs-only", domain],
+                capture_output=True, text=True, timeout=120
+            )
+            antes = len(subs)
+            for line in r.stdout.splitlines():
+                s = line.strip()
+                if s:
+                    subs.add(s)
+            log(f"assetfinder: +{len(subs)-antes} subdomínios", C.GREEN)
+        except Exception as e:
+            log(f"assetfinder erro: {e}", C.YELLOW)
+    else:
+        aviso_tool("assetfinder", "go install github.com/tomnomnom/assetfinder@latest")
+
+    # amass (opcional, mais lento)
+    if cmd_exists("amass"):
+        try:
+            r = subprocess.run(
+                ["amass", "enum", "-passive", "-d", domain],
+                capture_output=True, text=True, timeout=180
+            )
+            antes = len(subs)
+            for line in r.stdout.splitlines():
+                s = line.strip()
+                if s:
+                    subs.add(s)
+            log(f"amass: +{len(subs)-antes} subdomínios", C.GREEN)
+        except Exception:
+            pass
+
+    # Fallback sem dependências: crt.sh
+    if not subs:
+        subs.update(crtsh_enum(domain))
+
+    log(f"Total subdomínios encontrados: {len(subs)}", C.GREEN)
+    return subs
+
+
+def crtsh_enum(domain):
+    subs = set()
+    try:
+        url = f"https://crt.sh/?q=%.{domain}&output=json"
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            for entry in data:
+                for name in entry.get("name_value", "").splitlines():
+                    name = name.strip().lstrip("*.")
+                    if name and domain in name:
+                        subs.add(name)
+        log(f"crt.sh fallback: {len(subs)} subdomínios", C.GREEN)
+    except Exception as e:
+        log(f"crt.sh erro: {e}", C.YELLOW)
+    return subs
+
+
+def probe_subdomains(subs, threads=20):
+    """Verifica subdomínios ativos via httpx ou DNS."""
+    log(f"Verificando {len(subs)} subdomínios ativos...", C.CYAN)
+    ativos = set()
+
+    if cmd_exists("httpx"):
+        try:
+            entrada = "\n".join(subs)
+            r = subprocess.run(
+                ["httpx", "-silent", "-no-color"],
+                input=entrada, capture_output=True, text=True, timeout=300
+            )
+            for line in r.stdout.splitlines():
+                url = line.strip().split()[0] if line.strip() else ""
+                if url:
+                    ativos.add(url)
+            log(f"httpx: {len(ativos)} subdomínios ativos", C.GREEN)
+            return ativos
+        except Exception as e:
+            log(f"httpx erro: {e}", C.YELLOW)
+    else:
+        aviso_tool("httpx", "go install github.com/projectdiscovery/httpx/cmd/httpx@latest")
+
+    # Fallback: resolução DNS
+    def resolve(sub):
+        try:
+            socket.getaddrinfo(sub, 80, proto=socket.IPPROTO_TCP)
+            return f"http://{sub}"
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=threads) as ex:
+        for result in as_completed({ex.submit(resolve, s): s for s in subs}):
+            r = result.result()
+            if r:
+                ativos.add(r)
+
+    log(f"DNS probe: {len(ativos)} subdomínios ativos", C.GREEN)
+    return ativos
+
+
+# ============================================================
 # COLETA DE URLs
 # ============================================================
-def collect_urls(domain: str, sem_gau: bool, sem_wayback: bool) -> set:
-    print(f"\n{C.CYAN}[+] Coletando URLs...{C.RESET}")
+def collect_katana(target, depth=3):
     urls = set()
-
-    if not sem_gau:
-        try:
-            gau = subprocess.run(["gau", domain], capture_output=True, text=True, timeout=300)
-            for line in gau.stdout.splitlines():
-                line = line.strip()
-                if line and is_interesting_url(line):
-                    urls.add(line)
-            print(f"{C.GREEN}    gau: {len(urls)} URLs relevantes{C.RESET}")
-        except FileNotFoundError:
-            print(f"{C.YELLOW}[!] gau não encontrado. Instale: go install github.com/lc/gau/v2/cmd/gau@latest{C.RESET}")
-        except subprocess.TimeoutExpired:
-            print(f"{C.YELLOW}[!] gau excedeu o tempo limite{C.RESET}")
-        except Exception as e:
-            print(f"{C.YELLOW}[!] gau erro: {e}{C.RESET}")
-
-    if not sem_wayback:
-        antes = len(urls)
-        try:
-            wayback = subprocess.run(
-                ["waybackurls"], input=domain, capture_output=True, text=True, timeout=300
-            )
-            for line in wayback.stdout.splitlines():
-                line = line.strip()
-                if line and is_interesting_url(line):
-                    urls.add(line)
-            print(f"{C.GREEN}    waybackurls: +{len(urls)-antes} URLs relevantes{C.RESET}")
-        except FileNotFoundError:
-            print(f"{C.YELLOW}[!] waybackurls não encontrado. Instale: go install github.com/tomnomnom/waybackurls@latest{C.RESET}")
-        except subprocess.TimeoutExpired:
-            print(f"{C.YELLOW}[!] waybackurls excedeu o tempo limite{C.RESET}")
-        except Exception as e:
-            print(f"{C.YELLOW}[!] waybackurls erro: {e}{C.RESET}")
-
-    # Fallback via Wayback Machine CDX API (sem dependências externas)
-    if not urls:
-        print(f"{C.YELLOW}[~] Tentando fallback via Wayback Machine API...{C.RESET}")
-        urls.update(collect_via_cdx(domain))
-
+    if not cmd_exists("katana"):
+        aviso_tool("katana", "go install github.com/projectdiscovery/katana/cmd/katana@latest")
+        return urls
+    log(f"katana → {target} (depth={depth})", C.CYAN)
+    try:
+        r = subprocess.run(
+            [
+                "katana", "-u", target,
+                "-d", str(depth),
+                "-jc",                    # JS crawling (extrai endpoints/imports de arquivos JS)
+                "-kf", "all",             # extrai forms, scripts, links
+                "-ef", "png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,eot",
+                "-silent", "-nc",
+                "-timeout", "10",
+            ],
+            capture_output=True, text=True, timeout=600
+        )
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if line:
+                urls.add(line)
+        log(f"katana: {len(urls)} URLs coletadas", C.GREEN)
+    except subprocess.TimeoutExpired:
+        log("katana: timeout", C.YELLOW)
+    except Exception as e:
+        log(f"katana erro: {e}", C.YELLOW)
     return urls
 
 
-def collect_via_cdx(domain: str) -> set:
-    """Coleta URLs via Wayback Machine CDX API (sem ferramentas externas)."""
+def collect_gau(domain):
     urls = set()
-    ext_list = "|".join(e.lstrip(".") for e in EXTENSOES_INTERESSE)
-    cdx_url = (
+    if not cmd_exists("gau"):
+        aviso_tool("gau", "go install github.com/lc/gau/v2/cmd/gau@latest")
+        return urls
+    try:
+        r = subprocess.run(["gau", domain], capture_output=True, text=True, timeout=300)
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if line and is_interesting_url(line):
+                urls.add(line)
+        log(f"gau: {len(urls)} URLs relevantes", C.GREEN)
+    except Exception as e:
+        log(f"gau erro: {e}", C.YELLOW)
+    return urls
+
+
+def collect_wayback(domain):
+    urls = set()
+    if not cmd_exists("waybackurls"):
+        aviso_tool("waybackurls", "go install github.com/tomnomnom/waybackurls@latest")
+        return urls
+    try:
+        r = subprocess.run(["waybackurls"], input=domain, capture_output=True, text=True, timeout=300)
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if line and is_interesting_url(line):
+                urls.add(line)
+        log(f"waybackurls: {len(urls)} URLs relevantes", C.GREEN)
+    except Exception as e:
+        log(f"waybackurls erro: {e}", C.YELLOW)
+    return urls
+
+
+def collect_cdx(domain):
+    """Fallback sem dependências via Wayback CDX API."""
+    urls = set()
+    cdx = (
         f"http://web.archive.org/cdx/search/cdx"
-        f"?url=*.{domain}/*&output=text&fl=original&collapse=urlkey"
-        f"&filter=mimetype:.*&limit=5000"
+        f"?url=*.{domain}/*&output=text&fl=original&collapse=urlkey&limit=5000"
     )
     try:
-        req = Request(cdx_url, headers={"User-Agent": "Mozilla/5.0"})
+        req = Request(cdx, headers={"User-Agent": "Mozilla/5.0"})
         with urlopen(req, timeout=60) as resp:
             for line in resp.read().decode("utf-8").splitlines():
                 line = line.strip()
                 if line and is_interesting_url(line):
                     urls.add(line)
-        print(f"{C.GREEN}    CDX API: {len(urls)} URLs relevantes{C.RESET}")
+        log(f"CDX API fallback: {len(urls)} URLs", C.GREEN)
     except Exception as e:
-        print(f"{C.YELLOW}[!] Wayback CDX API falhou: {e}{C.RESET}")
+        log(f"CDX API erro: {e}", C.YELLOW)
     return urls
+
+
+def collect_all_urls(targets, args):
+    all_urls = set()
+    all_js   = set()
+
+    for target in targets:
+        domain = urlparse(target).netloc or target.lstrip("http://").lstrip("https://").split("/")[0]
+
+        if not args.sem_katana:
+            ku = collect_katana(target, depth=args.katana_depth)
+            all_urls.update(ku)
+            all_js.update(u for u in ku if is_js_url(u))
+
+        if not args.sem_gau:
+            gu = collect_gau(domain)
+            all_urls.update(gu)
+            all_js.update(u for u in gu if is_js_url(u))
+
+        if not args.sem_wayback:
+            wu = collect_wayback(domain)
+            all_urls.update(wu)
+            all_js.update(u for u in wu if is_js_url(u))
+
+    # Fallback caso nenhuma ferramenta esteja instalada
+    if not all_urls:
+        for target in targets:
+            domain = urlparse(target).netloc or target
+            cdx = collect_cdx(domain)
+            all_urls.update(cdx)
+            all_js.update(u for u in cdx if is_js_url(u))
+
+    download_urls = {u for u in all_urls if is_interesting_url(u)}
+    all_js.update(u for u in download_urls if is_js_url(u))
+
+    return download_urls, all_js
 
 
 # ============================================================
 # DOWNLOAD
 # ============================================================
-def download_file(url: str, dest: Path) -> bool:
-    timeout = CONFIG["timeout"]
+def download_file(url, dest):
+    timeout  = CONFIG["timeout"]
     max_size = CONFIG["max_size"]
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; SecurityResearch/1.0)"}
-    req = Request(url, headers=headers)
-
-    for tentativa in range(1, RETRY_DOWNLOAD + 1):
+    req = Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; SecurityResearch/1.0)"})
+    for attempt in range(1, RETRY + 1):
         try:
-            with urlopen(req, timeout=timeout) as response:
-                status = getattr(response, "status", 200)
-                if status >= 400:
+            with urlopen(req, timeout=timeout) as resp:
+                if getattr(resp, "status", 200) >= 400:
                     return False
-
-                cl = response.headers.get("Content-Length")
+                cl = resp.headers.get("Content-Length")
                 if cl:
                     try:
                         if int(cl) > max_size:
                             return False
                     except ValueError:
                         pass
-
-                data = response.read(max_size + 1)
+                data = resp.read(max_size + 1)
                 if len(data) > max_size:
                     return False
-
                 dest.write_bytes(data)
                 return True
-
-        except socket.timeout:
+        except (socket.timeout, URLError):
             pass
         except HTTPError as e:
-            if e.code in (404, 410):
+            if e.code in (404, 410, 403):
                 return False
-            pass
-        except URLError:
-            pass
         except Exception:
             pass
-
-        if tentativa < RETRY_DOWNLOAD:
-            time.sleep(2)
-
+        if attempt < RETRY:
+            time.sleep(1)
     return False
 
 
-def download_worker(args):
-    url, dest, is_sensitive = args
-    ok = download_file(url, dest)
-    return url, dest, ok, is_sensitive
-
-
-def batch_download(urls: set, download_dir: Path, sensitive_dir: Path) -> tuple[list, dict]:
+def batch_download(urls, download_dir, sensitive_dir):
     tasks = []
     for url in sorted(urls):
-        filename = unique_filename(url)
-        path = urlparse(url).path.lower()
-        is_sens = path.endswith(EXTENSOES_SENSIVEIS)
-        dest_dir = sensitive_dir if is_sens else download_dir
-        dest = dest_dir / filename
-        tasks.append((url, dest, is_sens))
+        fname   = unique_filename(url)
+        path    = urlparse(url).path.lower()
+        is_sens = path.endswith(EXTS_SENSIVEIS)
+        dest    = (sensitive_dir if is_sens else download_dir) / fname
+        tasks.append((url, dest))
 
     downloaded = []
-    url_map = {}
-    total = len(tasks)
+    url_map    = {}
+    total      = len(tasks)
 
-    print(f"\n{C.CYAN}[+] Baixando {total} arquivos com {CONFIG['threads']} threads...{C.RESET}")
+    log(f"Baixando {total} arquivos com {CONFIG['threads']} threads...", C.CYAN)
 
-    with ThreadPoolExecutor(max_workers=CONFIG["threads"]) as executor:
-        futures = {executor.submit(download_worker, t): t for t in tasks}
-        concluido = 0
-        for future in as_completed(futures):
-            concluido += 1
-            url, dest, ok, is_sens = future.result()
-            sys.stdout.write(f"\r    Progresso: {concluido}/{total}")
+    def worker(task):
+        url, dest = task
+        ok = download_file(url, dest)
+        return url, dest, ok
+
+    with ThreadPoolExecutor(max_workers=CONFIG["threads"]) as ex:
+        futures = {ex.submit(worker, t): t for t in tasks}
+        done = 0
+        for fut in as_completed(futures):
+            done += 1
+            url, dest, ok = fut.result()
+            sys.stdout.write(f"\r    [{done}/{total}] baixados...")
             sys.stdout.flush()
-
             if ok:
                 downloaded.append(dest)
                 url_map[str(dest)] = url
-                if dest.name.lower().endswith(EXTENSOES_CRITICAS):
-                    print(f"\n{C.RED}{C.BOLD}[!!!] ARQUIVO CRÍTICO BAIXADO: {dest}{C.RESET}")
-
+                if dest.name.lower().endswith(EXTS_CRITICAS):
+                    print()
+                    log(f"ARQUIVO CRÍTICO BAIXADO: {dest}", C.RED + C.BOLD)
     print()
     return downloaded, url_map
 
 
 # ============================================================
-# EXTRAÇÃO
+# EXTRAÇÃO DE ARQUIVOS
 # ============================================================
-def extract_if_archive(path: Path, out_dir: Path) -> list:
+def extract_archive(path, out_dir):
     extracted = []
     lower = path.name.lower()
     try:
@@ -551,34 +749,27 @@ def extract_if_archive(path: Path, out_dir: Path) -> list:
             with tarfile.open(path, "r:*") as tf:
                 tf.extractall(target)
                 extracted.extend(p for p in target.rglob("*") if p.is_file())
-    except Exception as e:
+    except Exception:
         pass
     return extracted
 
 
-# ============================================================
-# LEITURA DE CONTEÚDO
-# ============================================================
-def extract_content(path: Path) -> str:
+def extract_content(path):
     lower = path.name.lower()
-
     if lower.endswith(".pdf"):
-        return extract_text_from_pdf(path)
-
+        return _extract_pdf(path)
     if lower.endswith(".docx"):
-        return extract_text_from_docx(path)
-
-    if is_binary_file(path) and not lower.endswith((
+        return _extract_docx(path)
+    if is_binary(path) and not lower.endswith((
         ".json", ".js", ".map", ".xml", ".txt", ".log", ".sql", ".conf",
-        ".config", ".ini", ".yaml", ".yml", ".env", ".csv", ".sh", ".bash",
+        ".config", ".ini", ".yaml", ".yml", ".env", ".csv", ".sh",
         ".toml", ".properties", ".htaccess", ".htpasswd", ".netrc", ".npmrc",
     )):
         return ""
-
     return try_decode(path)
 
 
-def extract_text_from_pdf(path: Path) -> str:
+def _extract_pdf(path):
     try:
         import pypdf
         texts = []
@@ -588,17 +779,16 @@ def extract_text_from_pdf(path: Path) -> str:
                 texts.append(page.extract_text() or "")
         return "\n".join(texts)
     except ModuleNotFoundError:
-        aviso_pip("pypdf")
+        log("pypdf não instalado: pip install pypdf", C.YELLOW)
         return ""
     except Exception:
         return ""
 
 
-def extract_text_from_docx(path: Path) -> str:
+def _extract_docx(path):
     try:
-        import zipfile as zf
         import xml.etree.ElementTree as ET
-        with zf.ZipFile(path) as docx:
+        with zipfile.ZipFile(path) as docx:
             xml_content = docx.read("word/document.xml")
         root = ET.fromstring(xml_content)
         return "\n".join(n.text for n in root.iter() if n.tag.endswith("}t") and n.text)
@@ -609,34 +799,65 @@ def extract_text_from_docx(path: Path) -> str:
 # ============================================================
 # ANÁLISE DE CONTEÚDO
 # ============================================================
-def analyze_content(content: str, file_path: Path) -> list:
-    findings = []
-    seen = set()
+def extract_js_endpoints(content):
+    """Extrai endpoints e URLs ocultas de arquivos JS."""
+    endpoints = set()
+    # Paths de API relativos
+    for m in re.finditer(
+        r"""['"`](/(?:api|v\d+|internal|admin|graphql|rest|backend|private|auth|oauth|user|account)/[^\s'"`?#]{2,})['"`]""",
+        content
+    ):
+        endpoints.add(m.group(1))
+    # URLs absolutas
+    for m in re.finditer(r"""['"`](https?://[^'"`\s]{10,})['"`]""", content):
+        endpoints.add(m.group(1))
+    # import / require
+    for m in re.finditer(r"""(?:import|require)\s*\(?['"`]([^'"`]+)['"`]\)?""", content):
+        val = m.group(1)
+        if val.startswith("http") or val.startswith("/"):
+            endpoints.add(val)
+    return endpoints
 
+
+def analyze_content(content, file_path):
+    findings = []
+    seen     = set()
+
+    # Regex patterns
     for name, meta in PATTERNS.items():
         try:
             pattern = re.compile(meta["regex"])
         except re.error:
             continue
-
-        for match in pattern.finditer(content):
-            found = match.group(0)
-            key = (name, found)
+        for m in pattern.finditer(content):
+            found = m.group(0)
+            key   = (name, found)
             if key in seen:
                 continue
             seen.add(key)
-
             findings.append({
-                "type": name,
+                "type":     name,
                 "severity": meta["severity"],
-                "file": str(file_path),
-                "line": line_number(content, match.start()),
-                "match": found[:300],
-                "context": get_context(content, match.start(), match.end()),
+                "file":     str(file_path),
+                "line":     line_number(content, m.start()),
+                "match":    found[:300],
+                "context":  get_context(content, m.start(), m.end()),
             })
 
+    # Análise extra para arquivos JS
     lower = file_path.name.lower()
-    if lower.endswith((".js", ".map", ".json", ".ts")):
+    if lower.endswith((".js", ".map", ".ts")):
+        # Endpoints descobertos
+        for ep in extract_js_endpoints(content):
+            findings.append({
+                "type":     "JS Endpoint Discovered",
+                "severity": "low",
+                "file":     str(file_path),
+                "line":     0,
+                "match":    ep,
+                "context":  "",
+            })
+        # Keywords sensíveis
         kw_seen = set()
         for kw in KEYWORDS_JS:
             for m in re.finditer(re.escape(kw), content, re.IGNORECASE):
@@ -645,12 +866,12 @@ def analyze_content(content: str, file_path: Path) -> list:
                     continue
                 kw_seen.add(k)
                 findings.append({
-                    "type": "JS Keyword",
+                    "type":     "JS Sensitive Keyword",
                     "severity": "low",
-                    "file": str(file_path),
-                    "line": line_number(content, m.start()),
-                    "match": kw,
-                    "context": get_context(content, m.start(), m.end()),
+                    "file":     str(file_path),
+                    "line":     line_number(content, m.start()),
+                    "match":    kw,
+                    "context":  get_context(content, m.start(), m.end()),
                 })
 
     return findings
@@ -659,22 +880,22 @@ def analyze_content(content: str, file_path: Path) -> list:
 # ============================================================
 # ROBOTS.TXT
 # ============================================================
-def parse_robots_txt(content: str) -> list:
+def parse_robots(content):
     paths = set()
     for line in content.splitlines():
         line = line.strip()
         if not line or line.startswith("#") or ":" not in line:
             continue
         key, value = line.split(":", 1)
-        key = key.strip().lower()
+        key   = key.strip().lower()
         value = value.strip()
         if key in ("disallow", "allow") and value and value != "/":
             if value.startswith("http"):
                 try:
-                    parsed = urlparse(value)
-                    value = parsed.path or "/"
-                    if parsed.query:
-                        value += "?" + parsed.query
+                    p = urlparse(value)
+                    value = p.path or "/"
+                    if p.query:
+                        value += "?" + p.query
                 except Exception:
                     continue
             if not value.startswith("/"):
@@ -683,97 +904,108 @@ def parse_robots_txt(content: str) -> list:
     return sorted(paths)
 
 
-def check_url_with_curl(url: str) -> dict:
-    try:
-        result = subprocess.run(
-            ["curl", "-k", "-L", "-s", "-o", "/dev/null",
-             "-w", "%{http_code}|%{content_type}|%{size_download}",
-             "--max-time", "20", url],
-            capture_output=True, text=True, timeout=30
-        )
-        output = result.stdout.strip()
-        if "|" in output:
-            code, ctype, size = output.split("|", 2)
-            return {"url": url, "status": code, "content_type": ctype, "size": size}
-    except Exception:
-        pass
-    return {"url": url, "status": "erro", "content_type": "", "size": ""}
-
-
-def analyze_robots_paths(content: str, source_url: str) -> list:
+def check_robots_paths(content, source_url):
     findings = []
-    base_url = extract_base_from_url(source_url)
-    paths = parse_robots_txt(content)
+    base  = extract_base(source_url)
+    paths = parse_robots(content)
     if not paths:
         return findings
 
-    print(f"\n{C.CYAN}[+] robots.txt: testando {len(paths)} caminhos...{C.RESET}")
+    log(f"robots.txt: testando {len(paths)} caminhos em {base}", C.CYAN)
     seen = set()
-    for path in paths:
-        full_url = base_url + path
-        if full_url in seen:
-            continue
-        seen.add(full_url)
 
-        result = check_url_with_curl(full_url)
-        status = result["status"]
-        if status not in ROBOTS_STATUS_INTERESSANTES:
-            continue
+    def test_path(path):
+        full = base + path
+        if full in seen:
+            return None
+        seen.add(full)
+        try:
+            result = subprocess.run(
+                ["curl", "-k", "-L", "-s", "-o", "/dev/null",
+                 "-w", "%{http_code}|%{content_type}|%{size_download}",
+                 "--max-time", "15", full],
+                capture_output=True, text=True, timeout=20
+            )
+            out = result.stdout.strip()
+            if "|" in out:
+                code, ctype, size = out.split("|", 2)
+                return full, code, ctype, size
+        except Exception:
+            pass
+        return None
 
-        severity = "medium" if status in ("200", "204", "401", "403") else "low"
-        findings.append({
-            "type": "Robots Path Exposure",
-            "severity": severity,
-            "file": source_url,
-            "line": 0,
-            "match": full_url,
-            "context": f"status={status} content_type={result['content_type']} size={result['size']}",
-        })
-
-        if status in ("200", "401", "403"):
-            print(f"  {C.RED if status=='200' else C.YELLOW}[!!!] {full_url} -> HTTP {status}{C.RESET}")
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        futures = [ex.submit(test_path, p) for p in paths]
+        for fut in as_completed(futures):
+            res = fut.result()
+            if not res:
+                continue
+            full, code, ctype, size = res
+            if code not in ROBOTS_STATUS:
+                continue
+            sev = "medium" if code in ("200", "204", "401", "403") else "low"
+            findings.append({
+                "type":     "Robots Path Exposure",
+                "severity": sev,
+                "file":     source_url,
+                "line":     0,
+                "match":    full,
+                "context":  f"status={code} content_type={ctype} size={size}",
+            })
+            if code in ("200", "401", "403"):
+                cor = C.RED if code == "200" else C.YELLOW
+                log(f"robots: {full} → HTTP {code}", cor)
 
     return findings
 
 
 # ============================================================
-# ALERTAS E RELATÓRIO
+# ALERTA EM TEMPO REAL
 # ============================================================
-def immediate_alert(finding: dict, min_severity: str) -> None:
-    if SEVERITY_ORDER.get(finding["severity"], 0) < SEVERITY_ORDER.get(min_severity, 0):
+def alert(finding, min_sev):
+    if SEVERITY_ORDER.get(finding["severity"], 0) < SEVERITY_ORDER.get(min_sev, 0):
         return
-    cor = cor_severity(finding["severity"])
-    print(f"\n{cor}[!!!] {finding['severity'].upper()} — {finding['type']}{C.RESET}")
-    print(f"      Arquivo: {finding['file']}")
-    print(f"      Linha  : {finding['line']}")
-    print(f"      Match  : {finding['match'][:200]}")
+    cor = cor_sev(finding["severity"])
+    with LOCK:
+        print(f"\n{cor}{'━'*60}{C.RESET}")
+        print(f"{cor}[{finding['severity'].upper()}] {finding['type']}{C.RESET}")
+        print(f"  Arquivo : {finding['file']}")
+        if finding.get("line"):
+            print(f"  Linha   : {finding['line']}")
+        print(f"  Match   : {finding['match'][:200]}")
+        if finding.get("context"):
+            print(f"  Contexto: {finding['context'][:200]}")
+        print(f"{cor}{'━'*60}{C.RESET}\n")
 
 
-def save_reports(findings: list, dominio: str, base_dir: Path) -> None:
+# ============================================================
+# RELATÓRIOS (TXT + JSON + HTML interativo)
+# ============================================================
+def save_reports(findings, dominio, base_dir):
     report_txt  = base_dir / f"relatorio_{dominio}.txt"
     report_json = base_dir / f"relatorio_{dominio}.json"
     report_html = base_dir / f"relatorio_{dominio}.html"
 
-    findings_sorted = sorted(findings, key=lambda x: SEVERITY_ORDER.get(x["severity"], 0), reverse=True)
+    fs = sorted(findings, key=lambda x: SEVERITY_ORDER.get(x["severity"], 0), reverse=True)
+
+    resumo = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+    for item in fs:
+        resumo[item["severity"]] = resumo.get(item["severity"], 0) + 1
 
     # JSON
     with open(report_json, "w", encoding="utf-8") as f:
-        json.dump(findings_sorted, f, indent=2, ensure_ascii=False)
+        json.dump(fs, f, indent=2, ensure_ascii=False)
 
     # TXT
-    resumo = {"critical": 0, "high": 0, "medium": 0, "low": 0}
-    for item in findings_sorted:
-        resumo[item["severity"]] = resumo.get(item["severity"], 0) + 1
-
     with open(report_txt, "w", encoding="utf-8") as f:
-        f.write(f"Relatório de triagem — {dominio}\n")
+        f.write(f"Relatório — {dominio}\n")
         f.write(f"Gerado em: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write("=" * 80 + "\n\n")
-        f.write("Resumo:\n")
+        f.write("RESUMO:\n")
         for sev in ["critical", "high", "medium", "low"]:
-            f.write(f"  {sev.upper():8}: {resumo.get(sev, 0)}\n")
-        f.write(f"\n  TOTAL   : {len(findings_sorted)}\n\n")
-        for item in findings_sorted:
+            f.write(f"  {sev.upper():8}: {resumo[sev]}\n")
+        f.write(f"  {'TOTAL':8}: {len(fs)}\n\n")
+        for item in fs:
             f.write(f"[{item['severity'].upper()}] {item['type']}\n")
             f.write(f"Arquivo : {item['file']}\n")
             f.write(f"Linha   : {item['line']}\n")
@@ -781,65 +1013,114 @@ def save_reports(findings: list, dominio: str, base_dir: Path) -> None:
             f.write(f"Contexto: {item['context']}\n")
             f.write("-" * 80 + "\n")
 
-    # HTML
-    sev_colors = {"critical": "#dc2626", "high": "#ea580c", "medium": "#d97706", "low": "#2563eb"}
+    # HTML interativo com filtros
+    sev_colors = {
+        "critical": "#dc2626", "high": "#ea580c",
+        "medium": "#d97706",   "low": "#2563eb",
+    }
     rows = ""
-    for item in findings_sorted:
+    for item in fs:
         cor = sev_colors.get(item["severity"], "#6b7280")
-        rows += f"""
-        <tr>
-          <td><span class="badge" style="background:{cor}">{item['severity'].upper()}</span></td>
-          <td>{item['type']}</td>
-          <td style="word-break:break-all;font-size:0.85em">{item['file']}</td>
-          <td>{item['line']}</td>
-          <td style="word-break:break-all;font-size:0.85em;max-width:300px">{item['match'][:200]}</td>
-        </tr>"""
+        rows += (
+            f'<tr data-sev="{item["severity"]}">'
+            f'<td><span class="badge" style="background:{cor}">{item["severity"].upper()}</span></td>'
+            f'<td>{item["type"]}</td>'
+            f'<td class="small brk">{item["file"]}</td>'
+            f'<td>{item["line"]}</td>'
+            f'<td class="small brk">{item["match"][:200]}</td>'
+            f'<td class="small">{item["context"][:150]}</td>'
+            f'</tr>\n'
+        )
 
     html = f"""<!DOCTYPE html>
 <html lang="pt-br">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Relatório — {dominio}</title>
+<title>Recon — {dominio}</title>
 <style>
-  body{{font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;margin:0;padding:2rem}}
-  h1{{color:#38bdf8}}
-  .summary{{display:flex;gap:1rem;margin:1.5rem 0;flex-wrap:wrap}}
-  .card{{background:#1e293b;border-radius:8px;padding:1rem 1.5rem;min-width:120px;text-align:center}}
-  .card .num{{font-size:2rem;font-weight:bold}}
-  .card .label{{font-size:0.8rem;color:#94a3b8;text-transform:uppercase}}
-  table{{width:100%;border-collapse:collapse;background:#1e293b;border-radius:8px;overflow:hidden}}
-  th{{background:#334155;padding:0.75rem 1rem;text-align:left;font-size:0.8rem;text-transform:uppercase;color:#94a3b8}}
-  td{{padding:0.65rem 1rem;border-bottom:1px solid #334155;vertical-align:top}}
-  tr:hover td{{background:#263148}}
-  .badge{{display:inline-block;padding:2px 8px;border-radius:4px;color:#fff;font-size:0.75rem;font-weight:bold}}
-  .ts{{color:#64748b;font-size:0.8rem;margin-top:0.5rem}}
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;padding:2rem}}
+h1{{color:#38bdf8;margin-bottom:.3rem}}
+.ts{{color:#64748b;font-size:.8rem;margin-bottom:1.5rem}}
+.cards{{display:flex;gap:1rem;flex-wrap:wrap;margin-bottom:1.5rem}}
+.card{{background:#1e293b;border-radius:8px;padding:.9rem 1.4rem;min-width:110px;text-align:center}}
+.card .num{{font-size:1.8rem;font-weight:700}}
+.card .lbl{{font-size:.72rem;color:#94a3b8;text-transform:uppercase;margin-top:.2rem}}
+.toolbar{{display:flex;gap:.6rem;flex-wrap:wrap;margin-bottom:1rem;align-items:center}}
+input[type=text]{{background:#1e293b;border:1px solid #334155;border-radius:6px;
+  padding:.38rem .8rem;color:#e2e8f0;width:280px;font-size:.88rem}}
+button{{padding:.35rem .9rem;border-radius:6px;border:none;cursor:pointer;
+  font-size:.82rem;background:#334155;color:#e2e8f0;transition:.15s}}
+button.on{{font-weight:700;color:#0f172a}}
+table{{width:100%;border-collapse:collapse;background:#1e293b;border-radius:8px;
+  overflow:hidden;font-size:.84rem}}
+th{{background:#334155;padding:.6rem 1rem;text-align:left;font-size:.73rem;
+  text-transform:uppercase;color:#94a3b8}}
+td{{padding:.55rem 1rem;border-bottom:1px solid #1e3a5f;vertical-align:top}}
+tr:hover td{{background:#1a3050}}
+.badge{{display:inline-block;padding:2px 7px;border-radius:4px;
+  color:#fff;font-size:.72rem;font-weight:700}}
+.small{{font-size:.79rem}}.brk{{word-break:break-all;max-width:220px}}
+#count{{color:#64748b;font-size:.82rem}}
 </style>
 </head>
 <body>
-<h1>🔍 Relatório de Segurança — {dominio}</h1>
+<h1>🔍 Recon — {dominio}</h1>
 <p class="ts">Gerado em {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}</p>
-<div class="summary">
-  <div class="card"><div class="num" style="color:#dc2626">{resumo.get('critical',0)}</div><div class="label">Critical</div></div>
-  <div class="card"><div class="num" style="color:#ea580c">{resumo.get('high',0)}</div><div class="label">High</div></div>
-  <div class="card"><div class="num" style="color:#d97706">{resumo.get('medium',0)}</div><div class="label">Medium</div></div>
-  <div class="card"><div class="num" style="color:#2563eb">{resumo.get('low',0)}</div><div class="label">Low</div></div>
-  <div class="card"><div class="num">{len(findings_sorted)}</div><div class="label">Total</div></div>
+<div class="cards">
+  <div class="card"><div class="num" style="color:#dc2626">{resumo['critical']}</div><div class="lbl">Critical</div></div>
+  <div class="card"><div class="num" style="color:#ea580c">{resumo['high']}</div><div class="lbl">High</div></div>
+  <div class="card"><div class="num" style="color:#d97706">{resumo['medium']}</div><div class="lbl">Medium</div></div>
+  <div class="card"><div class="num" style="color:#2563eb">{resumo['low']}</div><div class="lbl">Low</div></div>
+  <div class="card"><div class="num">{len(fs)}</div><div class="lbl">Total</div></div>
+</div>
+<div class="toolbar">
+  <input type="text" id="q" placeholder="Filtrar por tipo, arquivo, match..." oninput="filter()">
+  <button class="on" style="background:#38bdf8" onclick="setSev('all',this)">Todos</button>
+  <button onclick="setSev('critical',this)" style="--c:#dc2626">Critical</button>
+  <button onclick="setSev('high',this)"     style="--c:#ea580c">High</button>
+  <button onclick="setSev('medium',this)"   style="--c:#d97706">Medium</button>
+  <button onclick="setSev('low',this)"      style="--c:#2563eb">Low</button>
+  <span id="count"></span>
 </div>
 <table>
-<thead><tr><th>Severity</th><th>Tipo</th><th>Arquivo</th><th>Linha</th><th>Match</th></tr></thead>
-<tbody>{rows}</tbody>
+<thead><tr>
+  <th>Severity</th><th>Tipo</th><th>Arquivo</th>
+  <th>Linha</th><th>Match</th><th>Contexto</th>
+</tr></thead>
+<tbody id="tbody">{rows}</tbody>
 </table>
+<script>
+let sev='all';
+function setSev(s,btn){{
+  sev=s;
+  document.querySelectorAll('button').forEach(b=>{{b.classList.remove('on');b.style.background='';}});
+  btn.classList.add('on');
+  btn.style.background = btn.style.getPropertyValue('--c')||'#38bdf8';
+  filter();
+}}
+function filter(){{
+  const q=document.getElementById('q').value.toLowerCase();
+  let vis=0;
+  document.querySelectorAll('#tbody tr').forEach(row=>{{
+    const ok=(sev==='all'||row.dataset.sev===sev)&&(!q||row.innerText.toLowerCase().includes(q));
+    row.style.display=ok?'':'none';
+    if(ok) vis++;
+  }});
+  document.getElementById('count').textContent=vis+' resultado(s)';
+}}
+filter();
+</script>
 </body>
 </html>"""
 
     with open(report_html, "w", encoding="utf-8") as f:
         f.write(html)
 
-    print(f"\n{C.GREEN}[+] Relatórios gerados:{C.RESET}")
-    print(f"    TXT  → {report_txt}")
-    print(f"    JSON → {report_json}")
-    print(f"    HTML → {report_html}")
+    log(f"TXT  → {report_txt}", C.GREEN)
+    log(f"JSON → {report_json}", C.GREEN)
+    log(f"HTML → {report_html}", C.GREEN)
 
 
 # ============================================================
@@ -851,61 +1132,80 @@ def main():
 
     dominio = args.dominio or input(f"{C.CYAN}Informe o domínio (ex: exemplo.com): {C.RESET}").strip().lower()
     if not dominio:
-        print(f"{C.RED}[!] Domínio inválido.{C.RESET}")
+        log("Domínio inválido.", C.RED)
         sys.exit(1)
 
     global CONFIG
     CONFIG = {
-        "threads":       args.threads,
-        "timeout":       args.timeout,
-        "max_size":      args.max_size * 1024 * 1024,
-        "min_severity":  args.min_severity,
+        "threads":  args.threads,
+        "timeout":  args.timeout,
+        "max_size": args.max_size * 1024 * 1024,
     }
 
-    base_dir      = Path(f"coleta_{dominio}")
-    download_dir  = base_dir / "downloads"
-    sensitive_dir = base_dir / "possivelmente_sensiveis"
-    extract_dir   = base_dir / "extraidos"
-    urls_file     = base_dir / f"urls_{dominio}.txt"
+    base_dir       = Path(f"coleta_{dominio}")
+    download_dir   = base_dir / "downloads"
+    sensitive_dir  = base_dir / "possivelmente_sensiveis"
+    extract_dir    = base_dir / "extraidos"
+    subs_file      = base_dir / f"subdomains_{dominio}.txt"
+    urls_file      = base_dir / f"urls_{dominio}.txt"
+    endpoints_file = base_dir / f"js_endpoints_{dominio}.txt"
 
     for d in [base_dir, download_dir, sensitive_dir, extract_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
     inicio = datetime.now()
-    print(f"{C.CYAN}[+] Alvo       : {dominio}")
-    print(f"[+] Threads    : {CONFIG['threads']}")
-    print(f"[+] Timeout    : {CONFIG['timeout']}s")
-    print(f"[+] Max tamanho: {args.max_size}MB{C.RESET}\n")
+    log(f"Alvo       : {dominio}", C.BOLD)
+    log(f"Threads    : {CONFIG['threads']}", C.CYAN)
+    log(f"Timeout    : {CONFIG['timeout']}s", C.CYAN)
+    log(f"Max tamanho: {args.max_size}MB\n", C.CYAN)
 
-    # 1. Coleta de URLs
-    urls = collect_urls(dominio, args.sem_gau, args.sem_wayback)
-    with open(urls_file, "w", encoding="utf-8") as f:
-        for url in sorted(urls):
-            f.write(url + "\n")
-    print(f"{C.GREEN}[+] {len(urls)} URLs filtradas → {urls_file}{C.RESET}")
+    # ── 1. Subdomínios ────────────────────────────────────────
+    targets = {f"https://{dominio}", f"http://{dominio}"}
 
-    if not urls:
-        print(f"{C.YELLOW}[!] Nenhuma URL encontrada. Encerrando.{C.RESET}")
-        sys.exit(0)
+    if not args.sem_subdomain:
+        subs = enum_subdomains(dominio, args.scope_file)
+        with open(subs_file, "w") as f:
+            for s in sorted(subs):
+                f.write(s + "\n")
+        log(f"{len(subs)} subdomínios salvos → {subs_file}", C.GREEN)
 
-    all_findings = []
+        ativos = probe_subdomains(subs, threads=args.threads)
+        targets.update(ativos)
+        log(f"{len(ativos)} subdomínios ativos adicionados ao escopo\n", C.GREEN)
+
+    log(f"Targets no escopo: {len(targets)}", C.BOLD)
+
+    # ── 2. Coleta de URLs ─────────────────────────────────────
+    download_urls, js_urls = collect_all_urls(targets, args)
+    all_js = js_urls | {u for u in download_urls if is_js_url(u)}
+
+    with open(urls_file, "w") as f:
+        for u in sorted(download_urls):
+            f.write(u + "\n")
+
+    log(f"{len(download_urls)} URLs relevantes → {urls_file}", C.GREEN)
+    log(f"{len(all_js)} arquivos JS identificados\n", C.GREEN)
+
+    all_findings  = []
+    all_endpoints = set()
 
     if not args.sem_download:
-        # 2. Download paralelo
-        downloaded_files, url_map = batch_download(urls, download_dir, sensitive_dir)
-        print(f"{C.GREEN}[+] Arquivos baixados: {len(downloaded_files)}{C.RESET}")
+        # ── 3. Download paralelo ──────────────────────────────
+        to_download = download_urls | all_js
+        downloaded, url_map = batch_download(to_download, download_dir, sensitive_dir)
+        log(f"Arquivos baixados: {len(downloaded)}", C.GREEN)
 
-        # 3. Extração de arquivos compactados
-        extracted_files = []
-        for fp in downloaded_files:
-            ex = extract_if_archive(fp, extract_dir)
-            extracted_files.extend(ex)
-        print(f"{C.GREEN}[+] Arquivos extraídos: {len(extracted_files)}{C.RESET}")
+        # ── 4. Extração ───────────────────────────────────────
+        extracted = []
+        for fp in downloaded:
+            extracted.extend(extract_archive(fp, extract_dir))
+        log(f"Arquivos extraídos: {len(extracted)}\n", C.GREEN)
 
-        all_files = downloaded_files + extracted_files
+        all_files = downloaded + extracted
 
-        # 4. Análise
-        print(f"\n{C.CYAN}[+] Analisando {len(all_files)} arquivos...{C.RESET}")
+        # ── 5. Análise ────────────────────────────────────────
+        log(f"Analisando {len(all_files)} arquivos...", C.CYAN)
+
         for fp in all_files:
             try:
                 content = extract_content(fp)
@@ -914,37 +1214,50 @@ def main():
 
                 findings = analyze_content(content, fp)
 
+                # robots.txt
                 if fp.name.lower().endswith("robots.txt"):
-                    src_url = url_map.get(str(fp), "")
-                    if src_url:
-                        findings.extend(analyze_robots_paths(content, src_url))
+                    src = url_map.get(str(fp), "")
+                    if src:
+                        findings.extend(check_robots_paths(content, src))
+
+                # Endpoints JS
+                if fp.name.lower().endswith((".js", ".ts", ".map")):
+                    all_endpoints.update(extract_js_endpoints(content))
 
                 for finding in findings:
                     all_findings.append(finding)
-                    immediate_alert(finding, CONFIG["min_severity"])
+                    alert(finding, args.min_severity)
 
-            except Exception as e:
+            except Exception:
                 pass
 
-    # 5. Relatório
+    # ── 6. Salva endpoints JS ─────────────────────────────────
+    if all_endpoints:
+        with open(endpoints_file, "w") as f:
+            for ep in sorted(all_endpoints):
+                f.write(ep + "\n")
+        log(f"{len(all_endpoints)} endpoints JS → {endpoints_file}", C.GREEN)
+
+    # ── 7. Relatórios ─────────────────────────────────────────
     save_reports(all_findings, dominio, base_dir)
 
-    # Resumo final
-    resumo = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+    # ── Resumo final ──────────────────────────────────────────
+    resumo  = {"critical": 0, "high": 0, "medium": 0, "low": 0}
     for item in all_findings:
         resumo[item["severity"]] = resumo.get(item["severity"], 0) + 1
 
-    duracao = (datetime.now() - inicio).seconds
-    print(f"\n{C.BOLD}{'='*50}{C.RESET}")
+    duracao = int((datetime.now() - inicio).total_seconds())
+    print(f"\n{C.BOLD}{'═'*55}{C.RESET}")
     print(f"{C.BOLD}  RESUMO FINAL — {dominio}{C.RESET}")
-    print(f"{'='*50}")
-    print(f"  {C.RED}CRITICAL : {resumo.get('critical',0)}{C.RESET}")
-    print(f"  {C.RED}HIGH     : {resumo.get('high',0)}{C.RESET}")
-    print(f"  {C.YELLOW}MEDIUM   : {resumo.get('medium',0)}{C.RESET}")
-    print(f"  {C.CYAN}LOW      : {resumo.get('low',0)}{C.RESET}")
+    print(f"{'═'*55}")
+    print(f"  {C.RED+C.BOLD}CRITICAL : {resumo['critical']}{C.RESET}")
+    print(f"  {C.RED}HIGH     : {resumo['high']}{C.RESET}")
+    print(f"  {C.YELLOW}MEDIUM   : {resumo['medium']}{C.RESET}")
+    print(f"  {C.CYAN}LOW      : {resumo['low']}{C.RESET}")
     print(f"  TOTAL    : {len(all_findings)}")
     print(f"  Tempo    : {duracao}s")
-    print(f"{'='*50}\n")
+    print(f"  Saída    : coleta_{dominio}/")
+    print(f"{'═'*55}\n")
 
 
 if __name__ == "__main__":
