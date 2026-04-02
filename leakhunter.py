@@ -63,24 +63,29 @@ def parse_args():
         description="Recon avançado para Bug Bounty",
         formatter_class=argparse.RawTextHelpFormatter,
         epilog="""Exemplos:
-  python3 leakhunter.py exemplo.com
-  python3 leakhunter.py exemplo.com --threads 20 --katana-depth 5
-  python3 leakhunter.py exemplo.com --sem-subdomain --min-severity high
-  python3 leakhunter.py exemplo.com --scope-file meus_subs.txt
-  python3 leakhunter.py exemplo.com --sem-download   # só coleta URLs
+  python3 coleta_dados.py exemplo.com
+  python3 coleta_dados.py exemplo.com --threads 20 --katana-depth 5
+  python3 coleta_dados.py exemplo.com --url-list minhas_urls.txt
+  python3 coleta_dados.py exemplo.com --sem-subdomain --min-severity high
+  python3 coleta_dados.py exemplo.com --scope-file meus_subs.txt
+  python3 coleta_dados.py exemplo.com --sem-download   # só coleta URLs
+  python3 coleta_dados.py exemplo.com --so-js          # foco total em JS
 """)
-    p.add_argument("dominio",          nargs="?", default=None)
-    p.add_argument("--threads",        type=int,  default=10)
-    p.add_argument("--timeout",        type=int,  default=30)
-    p.add_argument("--max-size",       type=int,  default=10,   help="MB máximo por arquivo (padrão: 10)")
-    p.add_argument("--katana-depth",   type=int,  default=3,    help="Profundidade do katana (padrão: 3)")
-    p.add_argument("--min-severity",   choices=["low","medium","high","critical"], default="low")
-    p.add_argument("--sem-katana",     action="store_true")
-    p.add_argument("--sem-gau",        action="store_true")
-    p.add_argument("--sem-wayback",    action="store_true")
-    p.add_argument("--sem-subdomain",  action="store_true")
-    p.add_argument("--sem-download",   action="store_true")
-    p.add_argument("--scope-file",     type=str,  default=None, help="Arquivo .txt com subdomínios no escopo")
+    p.add_argument("dominio",         nargs="?",  default=None)
+    p.add_argument("--threads",       type=int,   default=10)
+    p.add_argument("--timeout",       type=int,   default=30)
+    p.add_argument("--max-size",      type=int,   default=20,   help="MB máximo por arquivo (padrão: 20)")
+    p.add_argument("--katana-depth",  type=int,   default=3,    help="Profundidade do katana (padrão: 3)")
+    p.add_argument("--min-severity",  choices=["low","medium","high","critical"], default="low")
+    p.add_argument("--url-list",      type=str,   default=None, help="Arquivo .txt com URLs para analisar diretamente (pula coleta)")
+    p.add_argument("--scope-file",    type=str,   default=None, help="Arquivo .txt com subdomínios no escopo")
+    p.add_argument("--sem-katana",    action="store_true")
+    p.add_argument("--sem-gau",       action="store_true")
+    p.add_argument("--sem-wayback",   action="store_true")
+    p.add_argument("--sem-subdomain", action="store_true")
+    p.add_argument("--sem-download",  action="store_true")
+    p.add_argument("--so-js",         action="store_true", help="Baixa e analisa apenas arquivos JS/JSON/MAP")
+    p.add_argument("--sem-filtro",    action="store_true", help="Desativa filtro de extensão — baixa TUDO que o katana encontrar")
     return p.parse_args()
 
 CONFIG = {}
@@ -97,19 +102,23 @@ EXTS_INTERESSE = (
     ".sh", ".bash", ".htaccess", ".htpasswd", ".npmrc", ".netrc", ".toml",
     ".lock", ".properties", ".gradle", ".DS_Store",
 )
+
+EXTS_JS = (".js", ".json", ".map", ".ts", ".jsx", ".tsx", ".mjs", ".cjs")
+
 EXTS_SENSIVEIS = (
     ".env", ".bak", ".old", ".zip", ".tar", ".gz", ".tgz", ".sql", ".pem",
     ".key", ".pfx", ".p12", ".db", ".sqlite", ".sqlite3", ".backup", ".config",
     ".ini", ".yaml", ".yml", ".conf", ".htpasswd", ".netrc", ".npmrc",
 )
+
 EXTS_CRITICAS = (
     ".env", ".sql", ".pem", ".key", ".pfx", ".p12", ".db", ".sqlite",
     ".sqlite3", ".htpasswd", ".netrc", ".npmrc",
 )
 
-SEVERITY_ORDER  = {"low": 1, "medium": 2, "high": 3, "critical": 4}
-RETRY           = 3
-ROBOTS_STATUS   = {"200", "204", "301", "302", "401", "403"}
+SEVERITY_ORDER = {"low": 1, "medium": 2, "high": 3, "critical": 4}
+RETRY          = 3
+ROBOTS_STATUS  = {"200", "204", "301", "302", "401", "403"}
 
 # ============================================================
 # PADRÕES DE DETECÇÃO
@@ -246,7 +255,7 @@ PATTERNS = {
         "regex": r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b",
         "severity": "low",
     },
-    # ── Web vulnerabilidades ───────────────────────────────
+    # ── Web ────────────────────────────────────────────────
     "Open Redirect": {
         "regex": r"""(?i)[?&](?:redirect|return|url|next|goto|redir|redirect_uri|callback)\s*=\s*https?://""",
         "severity": "medium",
@@ -325,9 +334,29 @@ def cmd_exists(name):
         return False
 
 
-def is_interesting_url(url):
+def is_interesting_url(url, sem_filtro=False, so_js=False):
+    """
+    sem_filtro=True → aceita qualquer URL (exceto assets visuais óbvios)
+    so_js=True      → aceita apenas arquivos JS/JSON/MAP
+    padrão          → lista de extensões conhecidas
+    """
     try:
         path = urlparse(url).path.lower()
+
+        # Sempre ignora assets visuais que não têm valor de recon
+        SKIP = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
+                ".woff", ".woff2", ".ttf", ".eot", ".mp4", ".webm",
+                ".mp3", ".wav", ".css")
+        if path.endswith(SKIP):
+            return False
+
+        if so_js:
+            return path.endswith(EXTS_JS)
+
+        if sem_filtro:
+            return True  # aceita tudo exceto assets visuais acima
+
+        # Filtro padrão: extensões conhecidas + paths especiais
         return (
             path.endswith(EXTS_INTERESSE)
             or path.endswith("/robots.txt")
@@ -335,6 +364,8 @@ def is_interesting_url(url):
             or "/.git/config" in path
             or "/.env" in path
             or "backup" in path
+            # ← CORREÇÃO: URLs sem extensão explícita que podem ser JS chunks
+            or re.search(r"/(?:static|assets|js|scripts|chunk|bundle|app|main|vendor|runtime)[^/]*$", path) is not None
         )
     except Exception:
         return False
@@ -342,7 +373,11 @@ def is_interesting_url(url):
 
 def is_js_url(url):
     try:
-        return urlparse(url).path.lower().endswith((".js", ".map", ".ts"))
+        path = urlparse(url).path.lower()
+        # ← CORREÇÃO: inclui chunks sem extensão .js explícita
+        return path.endswith(EXTS_JS) or bool(
+            re.search(r"/(?:static|assets|js|scripts|chunk|bundle|app|main|vendor|runtime)[^/]*$", path)
+        )
     except Exception:
         return False
 
@@ -351,6 +386,8 @@ def unique_filename(url):
     parsed = urlparse(url)
     base   = os.path.basename(parsed.path) or "sem_nome"
     digest = hashlib.md5(url.encode()).hexdigest()[:10]
+    if not Path(base).suffix:
+        base += ".js"  # ← CORREÇÃO: chunks sem extensão recebem .js para análise correta
     if parsed.path.lower().endswith("/robots.txt"):
         base = "robots.txt"
     return f"{digest}_{base}"
@@ -389,6 +426,24 @@ def extract_base(url):
 
 
 # ============================================================
+# CARREGA URL LIST (modo manual)
+# ============================================================
+def load_url_list(path):
+    urls = set()
+    try:
+        with open(path) as f:
+            for line in f:
+                url = line.strip()
+                if url and url.startswith("http"):
+                    urls.add(url)
+        log(f"--url-list: {len(urls)} URLs carregadas de '{path}'", C.GREEN)
+    except Exception as e:
+        log(f"Erro ao ler --url-list: {e}", C.RED)
+        sys.exit(1)
+    return urls
+
+
+# ============================================================
 # ENUMERAÇÃO DE SUBDOMÍNIOS
 # ============================================================
 def enum_subdomains(domain, scope_file=None):
@@ -406,7 +461,6 @@ def enum_subdomains(domain, scope_file=None):
         except Exception as e:
             log(f"Erro ao ler scope file: {e}", C.YELLOW)
 
-    # subfinder
     if cmd_exists("subfinder"):
         try:
             r = subprocess.run(
@@ -426,7 +480,6 @@ def enum_subdomains(domain, scope_file=None):
     else:
         aviso_tool("subfinder", "go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest")
 
-    # assetfinder
     if cmd_exists("assetfinder"):
         try:
             r = subprocess.run(
@@ -444,7 +497,6 @@ def enum_subdomains(domain, scope_file=None):
     else:
         aviso_tool("assetfinder", "go install github.com/tomnomnom/assetfinder@latest")
 
-    # amass (opcional, mais lento)
     if cmd_exists("amass"):
         try:
             r = subprocess.run(
@@ -460,11 +512,10 @@ def enum_subdomains(domain, scope_file=None):
         except Exception:
             pass
 
-    # Fallback sem dependências: crt.sh
     if not subs:
         subs.update(crtsh_enum(domain))
 
-    log(f"Total subdomínios encontrados: {len(subs)}", C.GREEN)
+    log(f"Total subdomínios: {len(subs)}", C.GREEN)
     return subs
 
 
@@ -487,7 +538,6 @@ def crtsh_enum(domain):
 
 
 def probe_subdomains(subs, threads=20):
-    """Verifica subdomínios ativos via httpx ou DNS."""
     log(f"Verificando {len(subs)} subdomínios ativos...", C.CYAN)
     ativos = set()
 
@@ -509,7 +559,6 @@ def probe_subdomains(subs, threads=20):
     else:
         aviso_tool("httpx", "go install github.com/projectdiscovery/httpx/cmd/httpx@latest")
 
-    # Fallback: resolução DNS
     def resolve(sub):
         try:
             socket.getaddrinfo(sub, 80, proto=socket.IPPROTO_TCP)
@@ -530,7 +579,7 @@ def probe_subdomains(subs, threads=20):
 # ============================================================
 # COLETA DE URLs
 # ============================================================
-def collect_katana(target, depth=3):
+def collect_katana(target, depth, sem_filtro, so_js):
     urls = set()
     if not cmd_exists("katana"):
         aviso_tool("katana", "go install github.com/projectdiscovery/katana/cmd/katana@latest")
@@ -541,9 +590,9 @@ def collect_katana(target, depth=3):
             [
                 "katana", "-u", target,
                 "-d", str(depth),
-                "-jc",                    # JS crawling (extrai endpoints/imports de arquivos JS)
-                "-kf", "all",             # extrai forms, scripts, links
-                "-ef", "png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,eot",
+                "-jc",           # JS crawling — extrai endpoints/imports de arquivos JS
+                "-kf", "all",    # extrai forms, scripts e links
+                "-ef", "png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,eot,css",
                 "-silent", "-nc",
                 "-timeout", "10",
             ],
@@ -551,7 +600,7 @@ def collect_katana(target, depth=3):
         )
         for line in r.stdout.splitlines():
             line = line.strip()
-            if line:
+            if line and is_interesting_url(line, sem_filtro=sem_filtro, so_js=so_js):
                 urls.add(line)
         log(f"katana: {len(urls)} URLs coletadas", C.GREEN)
     except subprocess.TimeoutExpired:
@@ -561,7 +610,7 @@ def collect_katana(target, depth=3):
     return urls
 
 
-def collect_gau(domain):
+def collect_gau(domain, sem_filtro, so_js):
     urls = set()
     if not cmd_exists("gau"):
         aviso_tool("gau", "go install github.com/lc/gau/v2/cmd/gau@latest")
@@ -570,7 +619,7 @@ def collect_gau(domain):
         r = subprocess.run(["gau", domain], capture_output=True, text=True, timeout=300)
         for line in r.stdout.splitlines():
             line = line.strip()
-            if line and is_interesting_url(line):
+            if line and is_interesting_url(line, sem_filtro=sem_filtro, so_js=so_js):
                 urls.add(line)
         log(f"gau: {len(urls)} URLs relevantes", C.GREEN)
     except Exception as e:
@@ -578,7 +627,7 @@ def collect_gau(domain):
     return urls
 
 
-def collect_wayback(domain):
+def collect_wayback(domain, sem_filtro, so_js):
     urls = set()
     if not cmd_exists("waybackurls"):
         aviso_tool("waybackurls", "go install github.com/tomnomnom/waybackurls@latest")
@@ -587,7 +636,7 @@ def collect_wayback(domain):
         r = subprocess.run(["waybackurls"], input=domain, capture_output=True, text=True, timeout=300)
         for line in r.stdout.splitlines():
             line = line.strip()
-            if line and is_interesting_url(line):
+            if line and is_interesting_url(line, sem_filtro=sem_filtro, so_js=so_js):
                 urls.add(line)
         log(f"waybackurls: {len(urls)} URLs relevantes", C.GREEN)
     except Exception as e:
@@ -595,8 +644,7 @@ def collect_wayback(domain):
     return urls
 
 
-def collect_cdx(domain):
-    """Fallback sem dependências via Wayback CDX API."""
+def collect_cdx(domain, sem_filtro, so_js):
     urls = set()
     cdx = (
         f"http://web.archive.org/cdx/search/cdx"
@@ -607,7 +655,7 @@ def collect_cdx(domain):
         with urlopen(req, timeout=60) as resp:
             for line in resp.read().decode("utf-8").splitlines():
                 line = line.strip()
-                if line and is_interesting_url(line):
+                if line and is_interesting_url(line, sem_filtro=sem_filtro, so_js=so_js):
                     urls.add(line)
         log(f"CDX API fallback: {len(urls)} URLs", C.GREEN)
     except Exception as e:
@@ -616,36 +664,37 @@ def collect_cdx(domain):
 
 
 def collect_all_urls(targets, args):
-    all_urls = set()
-    all_js   = set()
+    sem_filtro = args.sem_filtro
+    so_js      = args.so_js
+    all_urls   = set()
+    all_js     = set()
 
     for target in targets:
-        domain = urlparse(target).netloc or target.lstrip("http://").lstrip("https://").split("/")[0]
+        domain = urlparse(target).netloc or target.split("/")[0]
 
         if not args.sem_katana:
-            ku = collect_katana(target, depth=args.katana_depth)
+            ku = collect_katana(target, args.katana_depth, sem_filtro, so_js)
             all_urls.update(ku)
             all_js.update(u for u in ku if is_js_url(u))
 
         if not args.sem_gau:
-            gu = collect_gau(domain)
+            gu = collect_gau(domain, sem_filtro, so_js)
             all_urls.update(gu)
             all_js.update(u for u in gu if is_js_url(u))
 
         if not args.sem_wayback:
-            wu = collect_wayback(domain)
+            wu = collect_wayback(domain, sem_filtro, so_js)
             all_urls.update(wu)
             all_js.update(u for u in wu if is_js_url(u))
 
-    # Fallback caso nenhuma ferramenta esteja instalada
     if not all_urls:
         for target in targets:
             domain = urlparse(target).netloc or target
-            cdx = collect_cdx(domain)
+            cdx = collect_cdx(domain, sem_filtro, so_js)
             all_urls.update(cdx)
             all_js.update(u for u in cdx if is_js_url(u))
 
-    download_urls = {u for u in all_urls if is_interesting_url(u)}
+    download_urls = all_urls if sem_filtro else {u for u in all_urls if is_interesting_url(u, sem_filtro, so_js)}
     all_js.update(u for u in download_urls if is_js_url(u))
 
     return download_urls, all_js
@@ -713,7 +762,7 @@ def batch_download(urls, download_dir, sensitive_dir):
         for fut in as_completed(futures):
             done += 1
             url, dest, ok = fut.result()
-            sys.stdout.write(f"\r    [{done}/{total}] baixados...")
+            sys.stdout.write(f"\r    [{done}/{total}] baixando...")
             sys.stdout.flush()
             if ok:
                 downloaded.append(dest)
@@ -795,18 +844,14 @@ def _extract_docx(path):
 # ANÁLISE DE CONTEÚDO
 # ============================================================
 def extract_js_endpoints(content):
-    """Extrai endpoints e URLs ocultas de arquivos JS."""
     endpoints = set()
-    # Paths de API relativos
     for m in re.finditer(
         r"""['"`](/(?:api|v\d+|internal|admin|graphql|rest|backend|private|auth|oauth|user|account)/[^\s'"`?#]{2,})['"`]""",
         content
     ):
         endpoints.add(m.group(1))
-    # URLs absolutas
     for m in re.finditer(r"""['"`](https?://[^'"`\s]{10,})['"`]""", content):
         endpoints.add(m.group(1))
-    # import / require
     for m in re.finditer(r"""(?:import|require)\s*\(?['"`]([^'"`]+)['"`]\)?""", content):
         val = m.group(1)
         if val.startswith("http") or val.startswith("/"):
@@ -818,7 +863,6 @@ def analyze_content(content, file_path):
     findings = []
     seen     = set()
 
-    # Regex patterns
     for name, meta in PATTERNS.items():
         try:
             pattern = re.compile(meta["regex"])
@@ -839,10 +883,8 @@ def analyze_content(content, file_path):
                 "context":  get_context(content, m.start(), m.end()),
             })
 
-    # Análise extra para arquivos JS
     lower = file_path.name.lower()
-    if lower.endswith((".js", ".map", ".ts")):
-        # Endpoints descobertos
+    if lower.endswith((".js", ".map", ".ts", ".mjs", ".cjs", ".jsx", ".tsx")):
         for ep in extract_js_endpoints(content):
             findings.append({
                 "type":     "JS Endpoint Discovered",
@@ -852,7 +894,6 @@ def analyze_content(content, file_path):
                 "match":    ep,
                 "context":  "",
             })
-        # Keywords sensíveis
         kw_seen = set()
         for kw in KEYWORDS_JS:
             for m in re.finditer(re.escape(kw), content, re.IGNORECASE):
@@ -974,7 +1015,7 @@ def alert(finding, min_sev):
 
 
 # ============================================================
-# RELATÓRIOS (TXT + JSON + HTML interativo)
+# RELATÓRIOS
 # ============================================================
 def save_reports(findings, dominio, base_dir):
     report_txt  = base_dir / f"relatorio_{dominio}.txt"
@@ -987,11 +1028,9 @@ def save_reports(findings, dominio, base_dir):
     for item in fs:
         resumo[item["severity"]] = resumo.get(item["severity"], 0) + 1
 
-    # JSON
     with open(report_json, "w", encoding="utf-8") as f:
         json.dump(fs, f, indent=2, ensure_ascii=False)
 
-    # TXT
     with open(report_txt, "w", encoding="utf-8") as f:
         f.write(f"Relatório — {dominio}\n")
         f.write(f"Gerado em: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
@@ -1008,7 +1047,6 @@ def save_reports(findings, dominio, base_dir):
             f.write(f"Contexto: {item['context']}\n")
             f.write("-" * 80 + "\n")
 
-    # HTML interativo com filtros
     sev_colors = {
         "critical": "#dc2626", "high": "#ea580c",
         "medium": "#d97706",   "low": "#2563eb",
@@ -1152,45 +1190,68 @@ def main():
     log(f"Alvo       : {dominio}", C.BOLD)
     log(f"Threads    : {CONFIG['threads']}", C.CYAN)
     log(f"Timeout    : {CONFIG['timeout']}s", C.CYAN)
-    log(f"Max tamanho: {args.max_size}MB\n", C.CYAN)
+    log(f"Max tamanho: {args.max_size}MB", C.CYAN)
+    if args.url_list:
+        log(f"Modo       : --url-list (pula coleta automática)", C.MAGENTA)
+    if args.sem_filtro:
+        log(f"Filtro     : DESATIVADO (baixa tudo)", C.YELLOW)
+    if args.so_js:
+        log(f"Foco       : apenas arquivos JS/JSON/MAP", C.CYAN)
+    print()
 
-    # ── 1. Subdomínios ────────────────────────────────────────
-    targets = {f"https://{dominio}", f"http://{dominio}"}
+    # ── 1. URLs: manual ou automático ────────────────────────
+    if args.url_list:
+        # Modo --url-list: pula toda a fase de coleta
+        manual_urls   = load_url_list(args.url_list)
+        download_urls = manual_urls
+        all_js        = {u for u in manual_urls if is_js_url(u)}
+        log(f"{len(all_js)} arquivos JS na lista\n", C.GREEN)
+    else:
+        # ── 1a. Subdomínios ───────────────────────────────────
+        targets = {f"https://{dominio}", f"http://{dominio}"}
 
-    if not args.sem_subdomain:
-        subs = enum_subdomains(dominio, args.scope_file)
-        with open(subs_file, "w") as f:
-            for s in sorted(subs):
-                f.write(s + "\n")
-        log(f"{len(subs)} subdomínios salvos → {subs_file}", C.GREEN)
+        if not args.sem_subdomain:
+            subs = enum_subdomains(dominio, args.scope_file)
+            with open(subs_file, "w") as f:
+                for s in sorted(subs):
+                    f.write(s + "\n")
+            log(f"{len(subs)} subdomínios salvos → {subs_file}", C.GREEN)
 
-        ativos = probe_subdomains(subs, threads=args.threads)
-        targets.update(ativos)
-        log(f"{len(ativos)} subdomínios ativos adicionados ao escopo\n", C.GREEN)
+            ativos = probe_subdomains(subs, threads=args.threads)
+            targets.update(ativos)
+            log(f"{len(ativos)} subdomínios ativos adicionados\n", C.GREEN)
 
-    log(f"Targets no escopo: {len(targets)}", C.BOLD)
+        log(f"Targets no escopo: {len(targets)}", C.BOLD)
 
-    # ── 2. Coleta de URLs ─────────────────────────────────────
-    download_urls, js_urls = collect_all_urls(targets, args)
-    all_js = js_urls | {u for u in download_urls if is_js_url(u)}
+        # ── 1b. Coleta de URLs ────────────────────────────────
+        download_urls, all_js = collect_all_urls(targets, args)
 
-    with open(urls_file, "w") as f:
-        for u in sorted(download_urls):
-            f.write(u + "\n")
+        with open(urls_file, "w") as f:
+            for u in sorted(download_urls):
+                f.write(u + "\n")
 
-    log(f"{len(download_urls)} URLs relevantes → {urls_file}", C.GREEN)
-    log(f"{len(all_js)} arquivos JS identificados\n", C.GREEN)
+        log(f"{len(download_urls)} URLs coletadas → {urls_file}", C.GREEN)
+        log(f"{len(all_js)} arquivos JS identificados\n", C.GREEN)
+
+        # Avisa se coleta veio vazia
+        if not download_urls:
+            log("ATENÇÃO: nenhuma URL foi coletada!", C.RED + C.BOLD)
+            log("Dicas:", C.YELLOW)
+            log("  • Verifique se katana/gau/waybackurls estão instalados", C.YELLOW)
+            log("  • Use --sem-filtro para relaxar o filtro de extensões", C.YELLOW)
+            log("  • Use --url-list <arquivo.txt> para passar URLs manualmente", C.YELLOW)
+            log("  • Use --so-js para focar apenas em arquivos JS", C.YELLOW)
 
     all_findings  = []
     all_endpoints = set()
 
-    if not args.sem_download:
-        # ── 3. Download paralelo ──────────────────────────────
+    if not args.sem_download and download_urls:
+        # ── 2. Download ───────────────────────────────────────
         to_download = download_urls | all_js
         downloaded, url_map = batch_download(to_download, download_dir, sensitive_dir)
         log(f"Arquivos baixados: {len(downloaded)}", C.GREEN)
 
-        # ── 4. Extração ───────────────────────────────────────
+        # ── 3. Extração ───────────────────────────────────────
         extracted = []
         for fp in downloaded:
             extracted.extend(extract_archive(fp, extract_dir))
@@ -1198,7 +1259,7 @@ def main():
 
         all_files = downloaded + extracted
 
-        # ── 5. Análise ────────────────────────────────────────
+        # ── 4. Análise ────────────────────────────────────────
         log(f"Analisando {len(all_files)} arquivos...", C.CYAN)
 
         for fp in all_files:
@@ -1209,14 +1270,12 @@ def main():
 
                 findings = analyze_content(content, fp)
 
-                # robots.txt
                 if fp.name.lower().endswith("robots.txt"):
                     src = url_map.get(str(fp), "")
                     if src:
                         findings.extend(check_robots_paths(content, src))
 
-                # Endpoints JS
-                if fp.name.lower().endswith((".js", ".ts", ".map")):
+                if fp.name.lower().endswith((".js", ".ts", ".map", ".mjs", ".cjs")):
                     all_endpoints.update(extract_js_endpoints(content))
 
                 for finding in findings:
@@ -1226,14 +1285,14 @@ def main():
             except Exception:
                 pass
 
-    # ── 6. Salva endpoints JS ─────────────────────────────────
+    # ── 5. Salva endpoints JS ─────────────────────────────────
     if all_endpoints:
         with open(endpoints_file, "w") as f:
             for ep in sorted(all_endpoints):
                 f.write(ep + "\n")
         log(f"{len(all_endpoints)} endpoints JS → {endpoints_file}", C.GREEN)
 
-    # ── 7. Relatórios ─────────────────────────────────────────
+    # ── 6. Relatórios ─────────────────────────────────────────
     save_reports(all_findings, dominio, base_dir)
 
     # ── Resumo final ──────────────────────────────────────────
