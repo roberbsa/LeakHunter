@@ -63,11 +63,11 @@ def parse_args():
         description="Recon avançado para Bug Bounty",
         formatter_class=argparse.RawTextHelpFormatter,
         epilog="""Exemplos:
-  python3 coleta_dados.py exemplo.com
-  python3 coleta_dados.py exemplo.com --threads 20 --katana-depth 5
-  python3 coleta_dados.py exemplo.com --sem-subdomain --min-severity high
-  python3 coleta_dados.py exemplo.com --scope-file meus_subs.txt
-  python3 coleta_dados.py exemplo.com --sem-download   # só coleta URLs
+  python3 leakhunter.py exemplo.com
+  python3 leakhunter.py exemplo.com --threads 20 --katana-depth 5
+  python3 leakhunter.py exemplo.com --sem-subdomain --min-severity high
+  python3 leakhunter.py exemplo.com --scope-file meus_subs.txt
+  python3 leakhunter.py exemplo.com --sem-download   # só coleta URLs
 """)
     p.add_argument("dominio",          nargs="?", default=None)
     p.add_argument("--threads",        type=int,  default=10)
